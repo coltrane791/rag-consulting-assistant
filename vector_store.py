@@ -1,6 +1,7 @@
 # vector_store.py
 import os, json, time, hashlib
 import faiss
+from typing import List, Dict
 
 MANIFEST = "manifest.json"
 INDEX = "index.faiss"
@@ -13,23 +14,23 @@ def file_sha256(path: str) -> str:
             h.update(block)
     return h.hexdigest()
 
-def save_index(index, chunks, index_dir, *, model_name, source_path, max_words):
+def save_index(index, chunks_meta: List[Dict], index_dir, *, model_name, sources: List[Dict], max_words):
+    """
+    sources: list of {"path": absolute_path, "hash": sha256}
+    chunks_meta: list of {"text":..., "source": filename, "chunk_id":...}
+    """
     os.makedirs(index_dir, exist_ok=True)
 
-    # Save FAISS index
     faiss.write_index(index, os.path.join(index_dir, INDEX))
 
-    # Save chunks
     with open(os.path.join(index_dir, CHUNKS), "w", encoding="utf-8") as f:
-        json.dump(chunks, f, ensure_ascii=False, indent=2)
+        json.dump(chunks_meta, f, ensure_ascii=False, indent=2)
 
-    # Save manifest
     manifest = {
         "model_name": model_name,
-        "source_path": os.path.abspath(source_path),
-        "source_hash": file_sha256(source_path),
         "max_words": max_words,
         "num_vectors": index.ntotal,
+        "sources": sources,            # [{path, hash}]
         "saved_at": int(time.time()),
     }
     with open(os.path.join(index_dir, MANIFEST), "w", encoding="utf-8") as f:
@@ -45,8 +46,8 @@ def load_index(index_dir):
 
     index = faiss.read_index(idx_path)
     with open(ch_path, "r", encoding="utf-8") as f:
-        chunks = json.load(f)
+        chunks_meta = json.load(f)
     with open(mf_path, "r", encoding="utf-8") as f:
         manifest = json.load(f)
 
-    return index, chunks, manifest
+    return index, chunks_meta, manifest
