@@ -11,16 +11,29 @@ from docx.enum.text import WD_ALIGN_PARAGRAPH
 from document_loader import load_and_chunk_folder
 from embed_and_search import build_vector_store, search_index, EMBED_MODEL
 from vector_store import save_index, load_index, file_sha256
+from retriever import retrieve_with_expansion_and_rerank
 
 load_dotenv()
 openai.api_key = os.getenv("OPENAI_API_KEY")
 
-def build_prompt(chunks, question, allow_general_knowledge: bool):
+# ---------- Helpers ----------
+def _label_for_chunk(c):
+    # If page is known (PDF), show it; else fall back to chunk id
+    if c.get("page"):
+        return f"{c['source']} p.{c['page']}"
+    return f"{c['source']} #{c['chunk_id']}"
+
+def _labels_for_chunks(chunks):
+    return [f"[{_label_for_chunk(c)}]" for c in chunks]
+
+def build_prompt(chunks, question, allow_general_knowledge: bool, require_citations: bool):
     """
-    Build the LLM prompt. In strict mode, the model must use only excerpts.
-    In hybrid mode, it may also use its general knowledge (but should prioritize excerpts).
+    Build the LLM prompt.
+    - allow_general_knowledge: Hybrid mode (use excerpts + model knowledge)
+    - require_citations: Strict citation mode (inline [Source p.X] after factual claims)
     """
-    excerpts_block = "\n\n".join([f"[{c['source']} #{c['chunk_id']}] {c['text']}" for c in chunks])
+    excerpts_block = "\n\n".join([f"[{_label_for_chunk(c)}] {c['text']}" for c in chunks])
+    labels_list = ", ".join(_labels_for_chunks(chunks))
 
     if allow_general_knowledge:
         instruction = (
@@ -32,6 +45,15 @@ def build_prompt(chunks, question, allow_general_knowledge: bool):
         instruction = (
             "You are an expert analyst. Using only the information in the provided document excerpts, "
             "answer the user's question concisely but with sufficient detail. If information is insufficient, say so."
+        )
+
+    if require_citations:
+        instruction += (
+            "\n\nCITATION RULES:\n"
+            f"- After each factual sentence or claim, include an inline citation using one of these labels: {labels_list}.\n"
+            "- Place the citation at the end of the sentence in square brackets, e.g., “... statement. [Source p.2]”.\n"
+            "- Only use the labels provided above; do not invent new ones. If multiple excerpts support a claim, cite the most direct.\n"
+            "- If a claim cannot be supported by the excerpts, state that explicitly (and in Hybrid mode, mark general knowledge as such)."
         )
 
     return (
@@ -52,7 +74,18 @@ def ask_llm(prompt, *, model="gpt-4", temperature=0.4):
     )
     return resp.choices[0].message.content.strip()
 
-def write_report_docx(question, answer, chunks, out_path, *, mode_label: str):
+def _has_any_label(answer_text: str, labels: list[str]) -> bool:
+    at_least_one = any(label in answer_text for label in labels)
+    return at_least_one
+
+def _append_sources_if_missing(answer_text: str, labels: list[str]) -> str:
+    # Safety net: if no inline labels appear, append a compact Sources line.
+    if _has_any_label(answer_text, labels):
+        return answer_text
+    compact = "; ".join(labels)
+    return answer_text + f"\n\n(Sources: {compact})"
+
+def write_report_docx(question, answer, chunks, out_path, *, mode_label: str, require_citations: bool):
     doc = Document()
 
     # Title
@@ -67,6 +100,11 @@ def write_report_docx(question, answer, chunks, out_path, *, mode_label: str):
     mode_p = doc.add_paragraph(f"Mode: {mode_label}")
     mode_p.alignment = WD_ALIGN_PARAGRAPH.CENTER
     mode_p.runs[0].font.size = Pt(10)
+
+    if require_citations:
+        cite_p = doc.add_paragraph("Citations: Inline labels like [Source p.X] appear after factual sentences.")
+        cite_p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        cite_p.runs[0].font.size = Pt(10)
 
     doc.add_paragraph("")
 
@@ -84,26 +122,37 @@ def write_report_docx(question, answer, chunks, out_path, *, mode_label: str):
     doc.add_paragraph("")
     h3 = doc.add_paragraph("Sources (Excerpts Used)"); h3.runs[0].bold = True
     for i, ch in enumerate(chunks, start=1):
-        p = doc.add_paragraph(f"Excerpt {i} — {ch['source']} #{ch['chunk_id']}:")
+        p = doc.add_paragraph(f"Excerpt {i} — {_label_for_chunk(ch)}:")
         p.runs[0].bold = True
         doc.add_paragraph(ch["text"])
 
     doc.save(out_path)
 
 def compute_corpus_sources(folder: str):
-    """Return [{path, hash}] for all .docx in folder (single-folder mode)."""
-    paths = [os.path.join(folder, f) for f in os.listdir(folder) if f.lower().endswith(".docx")]
+    """Return [{path, hash}] for all .docx/.pdf in folder (single-folder mode)."""
+    paths = [os.path.join(folder, f) for f in os.listdir(folder)
+             if f.lower().endswith(".docx") or f.lower().endswith(".pdf")]
     return [{"path": os.path.abspath(p), "hash": file_sha256(p)} for p in sorted(paths)]
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="RAG report generator")
     parser.add_argument("-g", "--use-general-knowledge", action="store_true",
                         help="Allow the model to use its general knowledge in addition to excerpts (hybrid mode).")
+    parser.add_argument("--cite", action="store_true",
+                        help="Require inline citations like [Source p.X] after factual claims.")
     parser.add_argument("--top-k", type=int, default=3, help="Number of excerpts to retrieve (default: 3).")
     parser.add_argument("--max-words", type=int, default=300, help="Chunk size in words (default: 300).")
     parser.add_argument("--model", type=str, default="gpt-4", help="OpenAI chat model (default: gpt-4).")
     parser.add_argument("--temperature", type=float, default=None,
-                        help="Override temperature. If not set, uses 0.4 (strict) or 0.6 (hybrid).")
+                        help="Override temperature. If not set, uses 0.4 (strict), 0.6 (hybrid), 0.35 (strict+cite), 0.5 (hybrid+cite).")
+    parser.add_argument("--expand-queries", type=int, default=0,
+                    help="Generate N paraphrases of the question for broader recall (default: 0).")
+    parser.add_argument("--per-query-k", type=int, default=8,
+                    help="Retrieve this many candidates per query/expansion (default: 8).")
+    parser.add_argument("--no-llm-rerank", action="store_true",
+                    help="Disable LLM reranking; sort by FAISS distance only.")
+    parser.add_argument("--rerank-model", type=str, default="gpt-4o-mini",
+                    help="Model to use for LLM reranking (default: gpt-4o-mini).")
     args = parser.parse_args()
 
     corpus_dir = "input"
@@ -136,11 +185,9 @@ if __name__ == "__main__":
             print(f"ℹ️ Could not load existing index ({e}). Will build a new one.")
 
     if index is None:
-        from document_loader import load_and_chunk_folder  # local import to avoid circulars
         print("🔄 Loading & chunking all documents in input/ ...")
-        chunks_meta = load_and_chunk_folder(corpus_dir, max_words=args.max_words)
+        chunks_meta = load_and_chunk_folder(corpus_dir, max_words=args.max_words, overlap=60)
 
-        from embed_and_search import build_vector_store, EMBED_MODEL
         print("🔄 Embedding and indexing...")
         index = build_vector_store(chunks_meta)
 
@@ -160,26 +207,50 @@ if __name__ == "__main__":
 
     # Ensure chunks_meta is present if we loaded index
     if chunks_meta is None:
-        # load_index already returned chunks_meta; only happens if logic above changes
         _, chunks_meta, _ = load_index(index_dir)
 
-    top_chunks = search_index(index, chunks_meta, question, top_k=args.top_k)
-
+    top_chunks = retrieve_with_expansion_and_rerank(
+    index,
+    chunks_meta,
+    question,
+    top_k=args.top_k,
+    expand_n=args.expand_queries,
+    per_query_k=args.per_query_k,
+    use_llm_rerank=(not args.no-llm-rerank),
+    rerank_model=args.rerank_model
+)
     # Prompt + LLM
-    prompt = build_prompt(top_chunks, question, allow_general_knowledge=args.use_general_knowledge)
+    prompt = build_prompt(
+        top_chunks,
+        question,
+        allow_general_knowledge=args.use_general_knowledge,
+        require_citations=args.cite
+    )
 
-    # Temperature: default 0.4 (strict) vs 0.6 (hybrid), unless overridden
+    # Temperature defaults tuned for mode
     if args.temperature is not None:
         temp = args.temperature
     else:
-        temp = 0.6 if args.use_general_knowledge else 0.4
+        if args.cite and args.use_general_knowledge:
+            temp = 0.50
+        elif args.cite and not args.use_general_knowledge:
+            temp = 0.35
+        elif not args.cite and args.use_general_knowledge:
+            temp = 0.60
+        else:
+            temp = 0.40
 
     print("📤 Querying LLM...")
     answer = ask_llm(prompt, model=args.model, temperature=temp)
+
+    # Safety net: ensure at least one label is present if --cite used
+    if args.cite:
+        labels = _labels_for_chunks(top_chunks)
+        answer = _append_sources_if_missing(answer, labels)
 
     # Save report
     ts = datetime.now().strftime("%Y%m%d-%H%M%S")
     out_path = os.path.join("output", f"report_{ts}.docx")
     mode_label = "Hybrid (RAG + General Knowledge)" if args.use_general_knowledge else "Strict RAG (Excerpts Only)"
-    write_report_docx(question, answer, top_chunks, out_path, mode_label=mode_label)
+    write_report_docx(question, answer, top_chunks, out_path, mode_label=mode_label, require_citations=args.cite)
     print(f"✅ Report saved to {out_path}")
