@@ -12,3 +12,17 @@ output/
 
 # Environment variables
 .env
+
+# Session logs and temporary files
+sessions/
+draft.md
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS generated files
+.DS_Store
+Thumbs.db

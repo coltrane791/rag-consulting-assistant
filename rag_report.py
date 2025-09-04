@@ -216,7 +216,7 @@ if __name__ == "__main__":
     top_k=args.top_k,
     expand_n=args.expand_queries,
     per_query_k=args.per_query_k,
-    use_llm_rerank=(not args.no-llm-rerank),
+    use_llm_rerank=(not args.no_llm_rerank),
     rerank_model=args.rerank_model
 )
     # Prompt + LLM
